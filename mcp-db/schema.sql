@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict 4yGGvIpUWbDgQ99otuzTZc11cNO4xjrqo8VVDQFYTEYTDBJF6uxmc6BkIf1iOC7
+\restrict zUYl3szozuSYEu46e69gZTyAodO4pESFnfbayaH6Q4gupPnty1brXKHlIIqNlqp
 
--- Dumped from database version 16.11 (Debian 16.11-1.pgdg13+1)
--- Dumped by pg_dump version 16.11 (Debian 16.11-1.pgdg13+1)
+-- Dumped from database version 16.12 (Debian 16.12-1.pgdg13+1)
+-- Dumped by pg_dump version 16.12 (Debian 16.12-1.pgdg13+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -30,6 +30,20 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
 --
 
 COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
+
+
+--
+-- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
 
 
 --
@@ -66,16 +80,16 @@ CREATE FUNCTION public.cleanup_expired_cache() RETURNS integer
 
 
 --
--- Name: generate_cache_hash(text, integer, text[], jsonb); Type: FUNCTION; Schema: public; Owner: -
+-- Name: generate_cache_hash(text, text, integer, text[], jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION public.generate_cache_hash(dataset_code text, year integer, variables text[], geography_spec jsonb) RETURNS text
+CREATE FUNCTION public.generate_cache_hash(dataset_param text, "group" text, year integer, variables text[], geography_spec jsonb) RETURNS text
     LANGUAGE plpgsql IMMUTABLE
     AS $$
     BEGIN
         RETURN encode(
             digest(
-                dataset_code || year::TEXT || array_to_string(variables, ',') || geography_spec::TEXT,
+                dataset_param || "group" || year::TEXT || array_to_string(variables, ',') || geography_spec::TEXT,
                 'sha256'
             ),
             'hex'
@@ -147,76 +161,79 @@ CREATE FUNCTION public.optimize_database() RETURNS text
 -- Name: search_data_tables(text, text, text, integer); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION public.search_data_tables(p_data_table_id text DEFAULT NULL::text, p_label_query text DEFAULT NULL::text, p_dataset_id text DEFAULT NULL::text, p_limit integer DEFAULT 20) RETURNS TABLE(data_table_id text, label text, datasets jsonb)
+CREATE FUNCTION public.search_data_tables(p_data_table_id text DEFAULT NULL::text, p_label_query text DEFAULT NULL::text, p_api_endpoint text DEFAULT NULL::text, p_limit integer DEFAULT 20) RETURNS TABLE(data_table_id text, label text, component text, datasets jsonb)
     LANGUAGE sql STABLE
     AS $$
+    WITH dataset_years AS (
+      SELECT
+        dtd.data_table_id                                        AS dt_id,
+        COALESCE(d.component_id::TEXT, d.api_endpoint)          AS group_key,
+        y.year::TEXT                                             AS year,
+        jsonb_agg(d.api_endpoint ORDER BY d.api_endpoint)       AS endpoints
+      FROM data_table_datasets dtd
+      JOIN datasets   d ON d.id = dtd.dataset_id
+      LEFT JOIN years y ON y.id = d.year_id
+      WHERE y.year IS NOT NULL
+      GROUP BY dtd.data_table_id, group_key, y.year
+    ),
+    dataset_map AS (
+      SELECT
+        dt_id,
+        group_key,
+        jsonb_object_agg(year, endpoints) AS datasets
+      FROM dataset_years
+      GROUP BY dt_id, group_key
+    )
     SELECT
       dt.data_table_id,
       dt.label,
-
-      -- Datasets array: include dataset-specific label only when it differs
-      -- from the canonical label (trimmed, case-insensitive comparison)
-      jsonb_agg(
-        CASE
-          WHEN LOWER(TRIM(dtd.label)) <> LOWER(TRIM(dt.label))
-          THEN jsonb_build_object(
-            'dataset_id', d.dataset_id,
-            'dataset_param', d.dataset_param,
-            'year',       y.year,
-            'label',      dtd.label
-          )
-          ELSE jsonb_build_object(
-            'dataset_id', d.dataset_id,
-            'dataset_param', d.dataset_param,
-            'year',       y.year
-          )
-        END
-        ORDER BY y.year
-      ) AS datasets
+      COALESCE(
+        p.label || ' - ' || c.label,
+        dm.group_key
+      ) AS component,
+      dm.datasets
 
     FROM data_tables dt
     JOIN data_table_datasets dtd ON dtd.data_table_id = dt.id
     JOIN datasets             d   ON d.id = dtd.dataset_id
+    JOIN dataset_map          dm  ON dm.dt_id = dt.id
+                                  AND dm.group_key = COALESCE(d.component_id::TEXT, d.api_endpoint)
+    LEFT JOIN components      c   ON c.id = d.component_id
+    LEFT JOIN programs        p   ON p.id = c.program_id
     LEFT JOIN years           y   ON y.id = d.year_id
 
     WHERE
-      -- Exact match or prefix match on data_table_id
       (
         p_data_table_id IS NULL
         OR dt.data_table_id = p_data_table_id
         OR dt.data_table_id ILIKE (p_data_table_id || '%')
       )
-
-      -- Filter by dataset string identifier (e.g. 'ACSDTY2009')
       AND (
-        p_dataset_id IS NULL
-        OR d.dataset_id = p_dataset_id
+        p_api_endpoint IS NULL
+        OR c.api_endpoint = p_api_endpoint
+        OR c.api_endpoint LIKE (p_api_endpoint || '/%')
+        OR p_api_endpoint LIKE (c.api_endpoint || '/%')
+        OR (c.id IS NULL AND (
+          d.api_endpoint = p_api_endpoint
+          OR d.api_endpoint LIKE (p_api_endpoint || '/%')
+          OR p_api_endpoint LIKE (d.api_endpoint || '/%')
+        ))
       )
-
-      -- Label search: when scoped to a dataset, search the variant label;
-      -- otherwise search the canonical label on data_tables
       AND (
         p_label_query IS NULL
-        OR (
-          p_dataset_id IS NULL
-          AND dt.label % p_label_query
-        )
-        OR (
-          p_dataset_id IS NOT NULL
-          AND dtd.label % p_label_query
-        )
+        OR dt.label % p_label_query
+        OR dtd.label % p_label_query
       )
 
-    GROUP BY dt.id, dt.data_table_id, dt.label
+    GROUP BY dt.id, dt.data_table_id, dt.label, p.label, c.label, dm.group_key, dm.datasets
 
-    -- When a label query is present and dataset scope is not specified, rank by full-text relevance;
-    -- otherwise fall back to alphabetical data_table_id order
     ORDER BY
       CASE
-        WHEN p_label_query IS NOT NULL AND p_dataset_id IS NULL
-          THEN SIMILARITY(dt.label, p_label_query)
-        WHEN p_label_query IS NOT NULL AND p_dataset_id IS NOT NULL
-          THEN MAX(SIMILARITY(dtd.label, p_label_query))
+        WHEN p_label_query IS NOT NULL
+          THEN GREATEST(
+            SIMILARITY(dt.label, p_label_query),
+            MAX(COALESCE(SIMILARITY(dtd.label, p_label_query), 0))
+          )
         ELSE 0
       END DESC,
       dt.data_table_id ASC
@@ -353,16 +370,6 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
--- Name: api_call_log; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.api_call_log (
-    url text NOT NULL,
-    last_called timestamp without time zone
-);
-
-
---
 -- Name: census_data_cache; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -398,6 +405,41 @@ CREATE SEQUENCE public.census_data_cache_id_seq
 --
 
 ALTER SEQUENCE public.census_data_cache_id_seq OWNED BY public.census_data_cache.id;
+
+
+--
+-- Name: components; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.components (
+    id bigint NOT NULL,
+    label text NOT NULL,
+    component_id character varying(60) NOT NULL,
+    api_endpoint character varying(60) NOT NULL,
+    description text NOT NULL,
+    program_id bigint NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: components_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.components_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: components_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.components_id_seq OWNED BY public.components.id;
 
 
 --
@@ -509,11 +551,12 @@ CREATE TABLE public.datasets (
     year_id bigint,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    dataset_param character varying(100) NOT NULL,
+    api_endpoint character varying(100) NOT NULL,
     description text NOT NULL,
     type character varying(30) NOT NULL,
     temporal_start date,
     temporal_end date,
+    component_id bigint,
     CONSTRAINT datasets_type_check CHECK (((type)::text = ANY ((ARRAY['aggregate'::character varying, 'microdata'::character varying, 'timeseries'::character varying])::text[]))),
     CONSTRAINT valid_temporal_range CHECK (((temporal_start IS NULL) OR (temporal_end IS NULL) OR (temporal_start <= temporal_end)))
 );
@@ -700,6 +743,39 @@ ALTER SEQUENCE public.places_id_seq OWNED BY public.geographies.id;
 
 
 --
+-- Name: programs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.programs (
+    id bigint NOT NULL,
+    label character varying(75) NOT NULL,
+    description text,
+    acronym character varying(15) NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: programs_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.programs_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: programs_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.programs_id_seq OWNED BY public.programs.id;
+
+
+--
 -- Name: topics; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -774,6 +850,13 @@ ALTER TABLE ONLY public.census_data_cache ALTER COLUMN id SET DEFAULT nextval('p
 
 
 --
+-- Name: components id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.components ALTER COLUMN id SET DEFAULT nextval('public.components_id_seq'::regclass);
+
+
+--
 -- Name: data_table_datasets id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -823,6 +906,13 @@ ALTER TABLE ONLY public.pgmigrations ALTER COLUMN id SET DEFAULT nextval('public
 
 
 --
+-- Name: programs id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.programs ALTER COLUMN id SET DEFAULT nextval('public.programs_id_seq'::regclass);
+
+
+--
 -- Name: summary_levels id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -844,14 +934,6 @@ ALTER TABLE ONLY public.years ALTER COLUMN id SET DEFAULT nextval('public.years_
 
 
 --
--- Name: api_call_log api_call_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.api_call_log
-    ADD CONSTRAINT api_call_log_pkey PRIMARY KEY (url);
-
-
---
 -- Name: census_data_cache census_data_cache_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -865,6 +947,30 @@ ALTER TABLE ONLY public.census_data_cache
 
 ALTER TABLE ONLY public.census_data_cache
     ADD CONSTRAINT census_data_cache_request_hash_key UNIQUE (request_hash);
+
+
+--
+-- Name: components components_api_endpoint_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.components
+    ADD CONSTRAINT components_api_endpoint_key UNIQUE (api_endpoint);
+
+
+--
+-- Name: components components_component_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.components
+    ADD CONSTRAINT components_component_id_key UNIQUE (component_id);
+
+
+--
+-- Name: components components_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.components
+    ADD CONSTRAINT components_pkey PRIMARY KEY (id);
 
 
 --
@@ -1020,6 +1126,22 @@ ALTER TABLE ONLY public.geographies
 
 
 --
+-- Name: programs programs_acronym_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.programs
+    ADD CONSTRAINT programs_acronym_key UNIQUE (acronym);
+
+
+--
+-- Name: programs programs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.programs
+    ADD CONSTRAINT programs_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: topics topics_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1080,6 +1202,13 @@ CREATE INDEX census_data_cache_request_hash_index ON public.census_data_cache US
 
 
 --
+-- Name: components_program_id_index; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX components_program_id_index ON public.components USING btree (program_id);
+
+
+--
 -- Name: data_table_datasets_data_table_id_index; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1098,6 +1227,13 @@ CREATE INDEX dataset_topics_dataset_id_index ON public.dataset_topics USING btre
 --
 
 CREATE INDEX dataset_topics_topic_id_index ON public.dataset_topics USING btree (topic_id);
+
+
+--
+-- Name: datasets_component_id_index; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX datasets_component_id_index ON public.datasets USING btree (component_id);
 
 
 --
@@ -1311,13 +1447,6 @@ CREATE INDEX topics_parent_topic_id_index ON public.topics USING btree (parent_t
 
 
 --
--- Name: topics_topic_string_index; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX topics_topic_string_index ON public.topics USING btree (topic_string);
-
-
---
 -- Name: census_data_cache update_census_data_cache_accessed; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -1329,6 +1458,14 @@ CREATE TRIGGER update_census_data_cache_accessed BEFORE UPDATE OF response_data 
 --
 
 CREATE TRIGGER update_geographies_updated_at BEFORE UPDATE ON public.geographies FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- Name: components components_program_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.components
+    ADD CONSTRAINT components_program_id_fkey FOREIGN KEY (program_id) REFERENCES public.programs(id) ON DELETE CASCADE;
 
 
 --
@@ -1361,6 +1498,14 @@ ALTER TABLE ONLY public.dataset_topics
 
 ALTER TABLE ONLY public.dataset_topics
     ADD CONSTRAINT dataset_topics_topic_id_fkey FOREIGN KEY (topic_id) REFERENCES public.topics(id) ON DELETE CASCADE;
+
+
+--
+-- Name: datasets datasets_component_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.datasets
+    ADD CONSTRAINT datasets_component_id_fkey FOREIGN KEY (component_id) REFERENCES public.components(id) ON DELETE CASCADE;
 
 
 --
@@ -1416,12 +1561,12 @@ ALTER TABLE ONLY public.geographies
 --
 
 ALTER TABLE ONLY public.topics
-    ADD CONSTRAINT topics_parent_topic_id_fkey FOREIGN KEY (parent_topic_id) REFERENCES public.topics(id) ON DELETE CASCADE;
+    ADD CONSTRAINT topics_parent_topic_id_fkey FOREIGN KEY (parent_topic_id) REFERENCES public.topics(id) ON DELETE SET NULL;
 
 
 --
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 4yGGvIpUWbDgQ99otuzTZc11cNO4xjrqo8VVDQFYTEYTDBJF6uxmc6BkIf1iOC7
+\unrestrict zUYl3szozuSYEu46e69gZTyAodO4pESFnfbayaH6Q4gupPnty1brXKHlIIqNlqp
 
